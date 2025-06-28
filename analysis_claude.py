@@ -2,16 +2,14 @@
 """
 Apache/Nginx Log Security Analyzer
 วิเคราะห์ log files เพื่อตรวจจับการโจมตีและแสดงผลเป็นกราฟ
+
 ติดตั้ง dependencies
 pip install pandas matplotlib seaborn
 
-วิเคราะห์ log file
-python log_analyzer.py /var/log/apache2/access.log
+Export เป็น text เท่านั้น
+python log_analyzer.py access.log --export-text report.txt
 
-ไม่แสดงกราฟ
-python log_analyzer.py /var/log/nginx/access.log --no-graph
-
-Export เป็น JSON
+Export เป็น JSON เท่านั้น
 python log_analyzer.py access.log --export-json report.json
 """
 
@@ -365,12 +363,164 @@ class LogSecurityAnalyzer:
             json.dump(report, f, ensure_ascii=False, indent=2)
         
         print(f"💾 บันทึกรายงานแล้ว: {filename}")
+    
+    def export_to_text(self, filename='security_report.txt'):
+        """Export ผลลัพธ์เป็น Text file"""
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("="*80 + "\n")
+            f.write("📊 รายงานการวิเคราะห์ความปลอดภัย Log Files\n")
+            f.write("="*80 + "\n")
+            f.write(f"📅 วันที่สร้างรายงาน: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"📈 จำนวน Log Entries ทั้งหมด: {len(self.parsed_logs):,}\n\n")
+            
+            if not self.attacks:
+                f.write("✅ ไม่พบการโจมตีที่น่าสงสัย\n")
+                return
+            
+            # สรุปการโจมตีแต่ละประเภท
+            f.write("🚨 สรุปประเภทการโจมตีที่พบ:\n")
+            f.write("-" * 50 + "\n")
+            total_attacks = 0
+            for attack_type, incidents in sorted(self.attacks.items(), key=lambda x: len(x[1]), reverse=True):
+                count = len(incidents)
+                total_attacks += count
+                f.write(f"   {attack_type:.<30} {count:>8,} ครั้ง\n")
+            
+            f.write("-" * 50 + "\n")
+            f.write(f"   {'รวมการโจมตีทั้งหมด':.<30} {total_attacks:>8,} ครั้ง\n\n")
+            
+            # IP ที่น่าสงสัยมากที่สุด
+            f.write("🔍 TOP 20 IP ที่น่าสงสัยมากที่สุด:\n")
+            f.write("-" * 60 + "\n")
+            f.write(f"{'อันดับ':<8} {'IP Address':<18} {'จำนวนการโจมตี':<15} {'ประเภท'}\n")
+            f.write("-" * 60 + "\n")
+            
+            for rank, (ip, count) in enumerate(self.suspicious_ips.most_common(20), 1):
+                ip_type = "Private" if self.is_private_ip(ip) else "Public"
+                f.write(f"{rank:<8} {ip:<18} {count:<15} {ip_type}\n")
+            
+            f.write("\n")
+            
+            # รายละเอียดการโจมตีแต่ละประเภท
+            f.write("📋 รายละเอียดการโจมตีแต่ละประเภท:\n")
+            f.write("="*80 + "\n")
+            
+            for attack_type, incidents in self.attacks.items():
+                f.write(f"\n--- {attack_type.upper()} ({len(incidents):,} ครั้ง) ---\n")
+                f.write("-" * 50 + "\n")
+                
+                # จัดกลุ่มตาม IP
+                ip_groups = defaultdict(list)
+                for incident in incidents:
+                    ip_groups[incident['ip']].append(incident)
+                
+                # แสดงข้อมูลตาม IP (top 10 IPs)
+                sorted_ips = sorted(ip_groups.items(), key=lambda x: len(x[1]), reverse=True)
+                
+                for i, (ip, ip_incidents) in enumerate(sorted_ips[:10], 1):
+                    ip_type = "🏠" if self.is_private_ip(ip) else "🌐"
+                    f.write(f"\n{i}. IP: {ip} {ip_type} ({len(ip_incidents)} ครั้ง)\n")
+                    
+                    # แสดงตัวอย่าง URLs (top 5)
+                    unique_urls = list(set([inc['url'] for inc in ip_incidents]))
+                    f.write(f"   URLs ที่ถูกโจมตี:\n")
+                    for j, url in enumerate(unique_urls[:5], 1):
+                        if len(url) > 100:
+                            url = url[:97] + "..."
+                        f.write(f"     {j}. {url}\n")
+                    
+                    if len(unique_urls) > 5:
+                        f.write(f"     ... และอีก {len(unique_urls) - 5} URLs\n")
+                    
+                    # แสดง User Agents ที่ไม่ซ้ำ
+                    unique_agents = list(set([inc['user_agent'] for inc in ip_incidents if inc['user_agent'] != '-']))
+                    if unique_agents:
+                        f.write(f"   User Agents:\n")
+                        for j, agent in enumerate(unique_agents[:3], 1):
+                            if len(agent) > 80:
+                                agent = agent[:77] + "..."
+                            f.write(f"     {j}. {agent}\n")
+                    
+                    # แสดงช่วงเวลา
+                    timestamps = [inc['timestamp'] for inc in ip_incidents]
+                    if timestamps:
+                        f.write(f"   ช่วงเวลา: {timestamps[0]} ถึง {timestamps[-1]}\n")
+                
+                if len(sorted_ips) > 10:
+                    f.write(f"\n   ... และอีก {len(sorted_ips) - 10} IPs\n")
+            
+            # สถิติเพิ่มเติม
+            f.write("\n" + "="*80 + "\n")
+            f.write("📊 สถิติเพิ่มเติม:\n")
+            f.write("="*80 + "\n")
+            
+            # Status Codes
+            all_status = []
+            for incidents in self.attacks.values():
+                all_status.extend([inc['status'] for inc in incidents])
+            
+            if all_status:
+                status_counts = Counter(all_status)
+                f.write("\n🔢 Status Codes ในการโจมตี:\n")
+                for status, count in sorted(status_counts.items()):
+                    percentage = (count / len(all_status)) * 100
+                    f.write(f"   {status}: {count:,} ครั้ง ({percentage:.1f}%)\n")
+            
+            # Methods
+            all_methods = []
+            for incidents in self.attacks.values():
+                all_methods.extend([inc.get('method', 'GET') for inc in incidents])
+            
+            if all_methods:
+                method_counts = Counter(all_methods)
+                f.write("\n🔧 HTTP Methods ในการโจมตี:\n")
+                for method, count in sorted(method_counts.items(), key=lambda x: x[1], reverse=True):
+                    percentage = (count / len(all_methods)) * 100
+                    f.write(f"   {method}: {count:,} ครั้ง ({percentage:.1f}%)\n")
+            
+            # Timeline analysis
+            try:
+                timestamps = []
+                for incidents in self.attacks.values():
+                    for inc in incidents:
+                        try:
+                            time_str = inc['timestamp'].split()[0]
+                            dt = datetime.strptime(time_str, '%d/%b/%Y:%H:%M:%S')
+                            timestamps.append(dt)
+                        except:
+                            continue
+                
+                if timestamps:
+                    f.write("\n⏰ การกระจายตัวตามเวลา:\n")
+                    hourly_attacks = Counter([dt.hour for dt in timestamps])
+                    f.write("   ชั่วโมงที่มีการโจมตีมากที่สุด (Top 5):\n")
+                    for hour, count in hourly_attacks.most_common(5):
+                        f.write(f"     {hour:02d}:00-{hour:02d}:59 -> {count:,} ครั้ง\n")
+                    
+                    # วันในสัปดาห์
+                    daily_attacks = Counter([dt.strftime('%A') for dt in timestamps])
+                    f.write("   วันที่มีการโจมตีมากที่สุด:\n")
+                    for day, count in daily_attacks.most_common():
+                        f.write(f"     {day}: {count:,} ครั้ง\n")
+            except:
+                pass
+            
+            f.write("\n" + "="*80 + "\n")
+            f.write("📝 หมายเหตุ:\n")
+            f.write("- 🌐 = Public IP, 🏠 = Private IP\n")
+            f.write("- รายงานนี้แสดงเฉพาะกิจกรรมที่ตรวจพบว่าน่าสงสัย\n")
+            f.write("- ควรตรวจสอบเพิ่มเติมก่อนดำเนินการใดๆ\n")
+            f.write("="*80 + "\n")
+        
+        print(f"💾 บันทึกรายงาน Text แล้ว: {filename}")
 
 def main():
     parser = argparse.ArgumentParser(description='Apache/Nginx Log Security Analyzer')
     parser.add_argument('logfile', help='Path to log file')
     parser.add_argument('--no-graph', action='store_true', help='ไม่แสดงกราฟ')
     parser.add_argument('--export-json', help='Export to JSON file')
+    parser.add_argument('--export-text', help='Export to Text file')
+    parser.add_argument('--export-all', action='store_true', help='Export ทั้ง JSON และ Text')
     
     args = parser.parse_args()
     
@@ -385,6 +535,13 @@ def main():
         
         if args.export_json:
             analyzer.export_to_json(args.export_json)
+        
+        if args.export_text:
+            analyzer.export_to_text(args.export_text)
+        
+        if args.export_all:
+            analyzer.export_to_json('security_report.json')
+            analyzer.export_to_text('security_report.txt')
     
     except FileNotFoundError:
         print(f"❌ ไม่พบไฟล์: {args.logfile}")
