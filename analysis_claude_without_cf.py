@@ -2,15 +2,7 @@
 """
 Apache/Nginx Log Security Analyzer
 วิเคราะห์ log files เพื่อตรวจจับการโจมตีและแสดงผลเป็นกราฟ
-
-ติดตั้ง dependencies
-pip install pandas matplotlib seaborn
-
-Export เป็น text เท่านั้น
-python log_analyzer.py access.log --export-text report.txt
-
-Export เป็น JSON เท่านั้น
-python log_analyzer.py access.log --export-json report.json
+กรอง Cloudflare IP addresses ออกจากการวิเคราะห์
 """
 
 import re
@@ -23,6 +15,7 @@ import argparse
 import json
 from urllib.parse import unquote
 import ipaddress
+import requests
 
 # ตั้งค่า matplotlib สำหรับภาษาไทย
 plt.rcParams['font.family'] = ['DejaVu Sans', 'Tahoma', 'Arial Unicode MS']
@@ -87,7 +80,70 @@ class LogSecurityAnalyzer:
         self.parsed_logs = []
         self.attacks = defaultdict(list)
         self.suspicious_ips = Counter()
+        self.cloudflare_ranges = []
+        self.filtered_ips_count = 0
         
+        # โหลด Cloudflare IP ranges
+        self.load_cloudflare_ranges()
+        
+    def load_cloudflare_ranges(self):
+        """โหลด Cloudflare IP ranges จาก API หรือใช้ค่าคงที่"""
+        print("🔄 กำลังโหลด Cloudflare IP ranges...")
+        
+        # Cloudflare IP ranges (IPv4) - อัพเดทล่าสุด
+        cloudflare_ipv4_ranges = [
+            "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+            "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+            "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22",
+            "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+            "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22"
+        ]
+        
+        # Cloudflare IP ranges (IPv6)
+        cloudflare_ipv6_ranges = [
+            "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+            "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29",
+            "2c0f:f248::/32"
+        ]
+        
+        try:
+            # ลองดึงจาก Cloudflare API
+            response_v4 = requests.get("https://www.cloudflare.com/ips-v4/", timeout=10)
+            response_v6 = requests.get("https://www.cloudflare.com/ips-v6/", timeout=10)
+            
+            if response_v4.status_code == 200:
+                cloudflare_ipv4_ranges = response_v4.text.strip().split('\n')
+                print(f"✅ โหลด Cloudflare IPv4 ranges จาก API: {len(cloudflare_ipv4_ranges)} ranges")
+            
+            if response_v6.status_code == 200:
+                cloudflare_ipv6_ranges = response_v6.text.strip().split('\n')
+                print(f"✅ โหลด Cloudflare IPv6 ranges จาก API: {len(cloudflare_ipv6_ranges)} ranges")
+                
+        except Exception as e:
+            print(f"⚠️  ไม่สามารถดึง Cloudflare ranges จาก API: {e}")
+            print("🔄 ใช้ค่าคงที่แทน...")
+        
+        # แปลงเป็น ipaddress objects
+        for cidr in cloudflare_ipv4_ranges + cloudflare_ipv6_ranges:
+            try:
+                if cidr.strip():  # ตรวจสอบว่าไม่เป็นค่าว่าง
+                    self.cloudflare_ranges.append(ipaddress.ip_network(cidr.strip()))
+            except ValueError as e:
+                print(f"⚠️  Invalid CIDR: {cidr} - {e}")
+        
+        print(f"✅ โหลด Cloudflare IP ranges เสร็จสิ้น: {len(self.cloudflare_ranges)} networks")
+    
+    def is_cloudflare_ip(self, ip):
+        """ตรวจสอบว่าเป็น Cloudflare IP หรือไม่"""
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            for network in self.cloudflare_ranges:
+                if ip_obj in network:
+                    return True
+            return False
+        except ValueError:
+            return False
+    
     def parse_log_line(self, line):
         """Parse single log line"""
         line = line.strip()
@@ -175,6 +231,11 @@ class LogSecurityAnalyzer:
                 if not parsed:
                     continue
                 
+                # ตรวจสอบว่าเป็น Cloudflare IP หรือไม่
+                if self.is_cloudflare_ip(parsed['ip']):
+                    self.filtered_ips_count += 1
+                    continue  # ข้าม Cloudflare IPs
+                
                 self.parsed_logs.append(parsed)
                 
                 # ตรวจจับการโจมตี
@@ -193,12 +254,15 @@ class LogSecurityAnalyzer:
                     self.suspicious_ips[parsed['ip']] += len(attacks)
         
         print(f"วิเคราะห์เสร็จแล้ว: {len(self.parsed_logs):,} entries")
+        print(f"🔒 กรอง Cloudflare IPs แล้ว: {self.filtered_ips_count:,} entries")
     
     def generate_report(self):
         """สร้างรายงานการโจมตี"""
         print("\n" + "="*80)
         print("📊 รายงานการวิเคราะห์ความปลอดภัย")
         print("="*80)
+        print(f"🔒 Cloudflare IPs ที่ถูกกรองออก: {self.filtered_ips_count:,} entries")
+        print(f"📈 Log entries ที่วิเคราะห์: {len(self.parsed_logs):,} entries")
         
         if not self.attacks:
             print("✅ ไม่พบการโจมตีที่น่าสงสัย")
@@ -217,8 +281,9 @@ class LogSecurityAnalyzer:
         # IP ที่น่าสงสัยมากที่สุด
         print(f"\n🔍 IP ที่น่าสงสัยมากที่สุด (Top 10):")
         for ip, count in self.suspicious_ips.most_common(10):
-            is_private = "🏠" if self.is_private_ip(ip) else "🌐"
-            print(f"   {is_private} {ip}: {count} การโจมตี")
+            ip_type = "🏠" if self.is_private_ip(ip) else "🌐"
+            cf_status = "🔶" if self.is_cloudflare_ip(ip) else ""
+            print(f"   {ip_type}{cf_status} {ip}: {count} การโจมตี")
         
         # รายละเอียดการโจมตีแต่ละประเภท
         print(f"\n📋 รายละเอียดการโจมตี:")
@@ -227,7 +292,9 @@ class LogSecurityAnalyzer:
             
             # แสดง 5 cases แรก
             for i, incident in enumerate(incidents[:5]):
-                print(f"  {i+1}. IP: {incident['ip']}")
+                ip_type = "🏠" if self.is_private_ip(incident['ip']) else "🌐"
+                cf_status = "🔶" if self.is_cloudflare_ip(incident['ip']) else ""
+                print(f"  {i+1}. IP: {ip_type}{cf_status} {incident['ip']}")
                 print(f"     URL: {incident['url'][:100]}...")
                 print(f"     Status: {incident['status']}")
                 print(f"     Time: {incident['timestamp']}")
@@ -249,7 +316,7 @@ class LogSecurityAnalyzer:
         sns.set_palette("husl")
         
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle('การวิเคราะห์ Log Security', fontsize=16, fontweight='bold')
+        fig.suptitle('การวิเคราะห์ Log Security (กรอง Cloudflare แล้ว)', fontsize=16, fontweight='bold')
         
         # 1. กราฟแท่งแสดงประเภทการโจมตี
         attack_counts = {k: len(v) for k, v in self.attacks.items()}
@@ -268,15 +335,19 @@ class LogSecurityAnalyzer:
             ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
                     str(count), ha='center', va='bottom', fontweight='bold')
         
-        # 2. Top 10 IP ที่น่าสงสัย
+        # 2. Top 10 IP ที่น่าสงสัย (ไม่รวม Cloudflare)
         ax2 = axes[0, 1]
-        top_ips = dict(self.suspicious_ips.most_common(10))
+        # กรอง Cloudflare IPs ออกจากการแสดงผล
+        non_cf_ips = {ip: count for ip, count in self.suspicious_ips.items() 
+                      if not self.is_cloudflare_ip(ip)}
+        top_ips = dict(Counter(non_cf_ips).most_common(10))
+        
         if top_ips:
             ips = list(top_ips.keys())
             counts = list(top_ips.values())
             
             bars = ax2.barh(range(len(ips)), counts, color='orange', alpha=0.7)
-            ax2.set_title('Top 10 IP ที่น่าสงสัย', fontweight='bold')
+            ax2.set_title('Top 10 IP ที่น่าสงสัย (ไม่รวม Cloudflare)', fontweight='bold')
             ax2.set_xlabel('จำนวนการโจมตี')
             ax2.set_ylabel('IP Address')
             ax2.set_yticks(range(len(ips)))
@@ -349,9 +420,11 @@ class LogSecurityAnalyzer:
         report = {
             'summary': {
                 'total_logs': len(self.parsed_logs),
+                'filtered_cloudflare_ips': self.filtered_ips_count,
                 'total_attacks': sum(len(incidents) for incidents in self.attacks.values()),
                 'attack_types': {k: len(v) for k, v in self.attacks.items()},
-                'top_suspicious_ips': dict(self.suspicious_ips.most_common(20))
+                'top_suspicious_ips': dict(self.suspicious_ips.most_common(20)),
+                'cloudflare_ranges_loaded': len(self.cloudflare_ranges)
             },
             'detailed_attacks': {}
         }
@@ -371,7 +444,9 @@ class LogSecurityAnalyzer:
             f.write("📊 รายงานการวิเคราะห์ความปลอดภัย Log Files\n")
             f.write("="*80 + "\n")
             f.write(f"📅 วันที่สร้างรายงาน: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"📈 จำนวน Log Entries ทั้งหมด: {len(self.parsed_logs):,}\n\n")
+            f.write(f"📈 จำนวน Log Entries ทั้งหมด: {len(self.parsed_logs):,}\n")
+            f.write(f"🔒 Cloudflare IPs ที่ถูกกรองออก: {self.filtered_ips_count:,}\n")
+            f.write(f"🛡️  Cloudflare IP ranges โหลดแล้ว: {len(self.cloudflare_ranges)} networks\n\n")
             
             if not self.attacks:
                 f.write("✅ ไม่พบการโจมตีที่น่าสงสัย\n")
@@ -389,17 +464,33 @@ class LogSecurityAnalyzer:
             f.write("-" * 50 + "\n")
             f.write(f"   {'รวมการโจมตีทั้งหมด':.<30} {total_attacks:>8,} ครั้ง\n\n")
             
-            # IP ที่น่าสงสัยมากที่สุด
+            # IP ที่น่าสงสัยมากที่สุด (แยก Cloudflare)
             f.write("🔍 TOP 20 IP ที่น่าสงสัยมากที่สุด:\n")
-            f.write("-" * 60 + "\n")
-            f.write(f"{'อันดับ':<8} {'IP Address':<18} {'จำนวนการโจมตี':<15} {'ประเภท'}\n")
-            f.write("-" * 60 + "\n")
+            f.write("-" * 70 + "\n")
+            f.write(f"{'อันดับ':<8} {'IP Address':<18} {'จำนวนการโจมตี':<15} {'ประเภท':<12} {'CF'}\n")
+            f.write("-" * 70 + "\n")
             
             for rank, (ip, count) in enumerate(self.suspicious_ips.most_common(20), 1):
                 ip_type = "Private" if self.is_private_ip(ip) else "Public"
-                f.write(f"{rank:<8} {ip:<18} {count:<15} {ip_type}\n")
+                cf_status = "CF" if self.is_cloudflare_ip(ip) else ""
+                f.write(f"{rank:<8} {ip:<18} {count:<15} {ip_type:<12} {cf_status}\n")
             
             f.write("\n")
+            
+            # แยกแสดง Non-Cloudflare IPs
+            non_cf_ips = {ip: count for ip, count in self.suspicious_ips.items() 
+                          if not self.is_cloudflare_ip(ip)}
+            
+            if non_cf_ips:
+                f.write("🎯 TOP 10 IP ที่น่าสงสัยมากที่สุด (ไม่รวม Cloudflare):\n")
+                f.write("-" * 60 + "\n")
+                f.write(f"{'อันดับ':<8} {'IP Address':<18} {'จำนวนการโจมตี':<15} {'ประเภท'}\n")
+                f.write("-" * 60 + "\n")
+                
+                for rank, (ip, count) in enumerate(Counter(non_cf_ips).most_common(10), 1):
+                    ip_type = "Private" if self.is_private_ip(ip) else "Public"
+                    f.write(f"{rank:<8} {ip:<18} {count:<15} {ip_type}\n")
+                f.write("\n")
             
             # รายละเอียดการโจมตีแต่ละประเภท
             f.write("📋 รายละเอียดการโจมตีแต่ละประเภท:\n")
@@ -419,7 +510,8 @@ class LogSecurityAnalyzer:
                 
                 for i, (ip, ip_incidents) in enumerate(sorted_ips[:10], 1):
                     ip_type = "🏠" if self.is_private_ip(ip) else "🌐"
-                    f.write(f"\n{i}. IP: {ip} {ip_type} ({len(ip_incidents)} ครั้ง)\n")
+                    cf_status = "🔶" if self.is_cloudflare_ip(ip) else ""
+                    f.write(f"\n{i}. IP: {ip_type}{cf_status} {ip} ({len(ip_incidents)} ครั้ง)\n")
                     
                     # แสดงตัวอย่าง URLs (top 5)
                     unique_urls = list(set([inc['url'] for inc in ip_incidents]))
@@ -507,7 +599,7 @@ class LogSecurityAnalyzer:
             
             f.write("\n" + "="*80 + "\n")
             f.write("📝 หมายเหตุ:\n")
-            f.write("- 🌐 = Public IP, 🏠 = Private IP\n")
+            f.write("- 🌐 = Public IP, 🏠 = Private IP, 🔶 = Cloudflare IP\n")
             f.write("- รายงานนี้แสดงเฉพาะกิจกรรมที่ตรวจพบว่าน่าสงสัย\n")
             f.write("- ควรตรวจสอบเพิ่มเติมก่อนดำเนินการใดๆ\n")
             f.write("="*80 + "\n")
